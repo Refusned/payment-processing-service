@@ -16,6 +16,7 @@
 из retry-очереди в рабочую или из рабочей в DLQ.
 """
 
+import asyncio
 import uuid
 from collections.abc import Mapping
 from typing import Any
@@ -76,12 +77,13 @@ dead_letter_queue = RabbitQueue(
 )
 
 
-def build_broker(prefetch: int | None = None) -> RabbitBroker:
+def build_broker(prefetch: int | None = None, graceful_timeout: float | None = None) -> RabbitBroker:
     # on_return_raises: сообщение, которое не попало ни в одну очередь (нет binding),
     # приводит к исключению, а не тихо возвращается. Иначе outbox пометил бы его отправленным.
     return RabbitBroker(
         settings.rabbitmq_url,
         default_channel=Channel(prefetch_count=prefetch, on_return_raises=True),
+        graceful_timeout=graceful_timeout,
     )
 
 
@@ -121,16 +123,18 @@ async def reliable_publish(
     Бросает исключение, если брокер не подтвердил приём, сообщение не нашло очередь
     или подтверждение не пришло за publish_timeout.
     """
-    await broker.publish(
-        body,
-        exchange=exchange,
-        routing_key=routing_key,
-        headers=headers,
-        persist=True,
-        mandatory=True,
-        timeout=settings.publish_timeout,
-        # Транспортный id уникален на каждую публикацию: aiormq сопоставляет возвраты
-        # по message_id и путает одновременные публикации с одинаковым id.
-        # Стабильный id события едет в заголовке x-event-id.
-        message_id=uuid.uuid4().hex,
-    )
+    # Общий дедлайн: timeout у publish покрывает только ожидание подтверждения,
+    # а не восстановление канала перед отправкой.
+    async with asyncio.timeout(settings.publish_timeout):
+        await broker.publish(
+            body,
+            exchange=exchange,
+            routing_key=routing_key,
+            headers=headers,
+            persist=True,
+            mandatory=True,
+            # Транспортный id уникален на каждую публикацию: aiormq сопоставляет возвраты
+            # по message_id и путает одновременные публикации с одинаковым id.
+            # Стабильный id события едет в заголовке x-event-id.
+            message_id=uuid.uuid4().hex,
+        )

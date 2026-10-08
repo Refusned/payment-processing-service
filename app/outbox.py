@@ -10,7 +10,13 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.config import settings
-from app.messaging import ATTEMPT_HEADER, EVENT_ID_HEADER, NEW_ROUTING_KEY, reliable_publish
+from app.messaging import (
+    ATTEMPT_HEADER,
+    EVENT_ID_HEADER,
+    NEW_ROUTING_KEY,
+    declare_topology,
+    reliable_publish,
+)
 from app.models import OutboxEvent
 
 logger = logging.getLogger(__name__)
@@ -27,6 +33,9 @@ class OutboxRelay:
     Событие помечается опубликованным только после подтверждения брокера и в той же
     транзакции, которая держит строку. Падение между подтверждением и коммитом
     приведёт к повторной публикации: гарантия at-least-once, consumer к дублям готов.
+
+    Подключение к брокеру тоже делает релей, с повторами. Поэтому api стартует и принимает
+    платежи, даже если RabbitMQ в этот момент недоступен.
     """
 
     def __init__(self, broker: RabbitBroker, session_factory: async_sessionmaker[AsyncSession]) -> None:
@@ -34,6 +43,7 @@ class OutboxRelay:
         self._session_factory = session_factory
         self._task: asyncio.Task[None] | None = None
         self._heartbeat = time.monotonic()
+        self._connected = False
 
     def start(self) -> None:
         self._task = asyncio.create_task(self._run(), name="outbox-relay")
@@ -57,6 +67,10 @@ class OutboxRelay:
         while True:
             self._heartbeat = time.monotonic()
             try:
+                if not self._connected:
+                    await self._broker.connect()
+                    await declare_topology(self._broker)
+                    self._connected = True
                 published = await self.publish_batch()
             except Exception:
                 failures += 1
@@ -82,6 +96,7 @@ class OutboxRelay:
 
             published = 0
             for event in events:
+                self._heartbeat = time.monotonic()
                 try:
                     await reliable_publish(
                         self._broker,

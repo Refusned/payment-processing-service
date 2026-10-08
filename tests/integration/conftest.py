@@ -6,6 +6,7 @@
 или просто `make test-integration`.
 """
 
+import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from pathlib import Path
@@ -21,6 +22,30 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
     for item in items:
         if Path(str(item.fspath)).is_relative_to(Path(__file__).parent):
             item.add_marker(pytest.mark.integration)
+
+
+@pytest.fixture(scope="session", autouse=True)
+def stack_ready() -> None:
+    """`up --wait` не знает, подписался ли consumer на очередь. Ждём явно."""
+    deadline = time.monotonic() + 60
+    with httpx.Client(timeout=5) as client:
+        while True:
+            try:
+                api = client.get(f"{API_URL}/health", headers={"X-API-Key": ENV["API_KEY"]})
+                queue = client.get(f"{RABBIT_API_URL}/queues/%2F/payments.new", auth=("guest", "guest"))
+                receiver = client.get(f"{RECEIVER_URL}/received")
+                if (
+                    api.status_code == 200
+                    and receiver.status_code == 200
+                    and queue.status_code == 200
+                    and queue.json().get("consumers", 0) > 0
+                ):
+                    return
+            except httpx.HTTPError:
+                pass
+            if time.monotonic() > deadline:
+                pytest.fail("test stack is not ready, start it with `make test-integration`")
+            time.sleep(1)
 
 
 @pytest.fixture

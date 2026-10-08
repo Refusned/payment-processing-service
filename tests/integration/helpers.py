@@ -27,15 +27,20 @@ DATABASE_DSN = f"postgresql://payments:payments@127.0.0.1:{ENV['POSTGRES_PORT']}
 # Адрес получателя внутри docker-сети, по нему ходит consumer.
 INTERNAL_RECEIVER_URL = "http://webhook-receiver:9000"
 VHOST = quote("/", safe="")
+COMPOSE = ["docker", "compose", "-p", ENV["COMPOSE_PROJECT_NAME"], "--env-file", str(ENV_FILE)]
 
 
-def compose(*args: str) -> None:
-    subprocess.run(
-        ["docker", "compose", "-p", ENV["COMPOSE_PROJECT_NAME"], "--env-file", str(ENV_FILE), *args],
+async def compose(*args: str) -> str:
+    result = await asyncio.to_thread(
+        subprocess.run,
+        [*COMPOSE, *args],
         cwd=ROOT,
         check=True,
         capture_output=True,
+        text=True,
+        timeout=180,
     )
+    return result.stdout
 
 
 def payment_body(
@@ -51,15 +56,21 @@ def payment_body(
 
 
 async def eventually[T](check: Callable[[], Awaitable[T | None]], within: float = 30) -> T:
-    """Опрашивать check, пока он не вернёт непустое значение, но не дольше within секунд."""
-    deadline = asyncio.get_running_loop().time() + within
-    while True:
-        result = await check()
-        if result:
-            return result
-        if asyncio.get_running_loop().time() > deadline:
-            raise AssertionError(f"condition not met within {within}s, last value: {result!r}")
-        await asyncio.sleep(0.3)
+    """Опрашивать check, пока он не вернёт непустое значение. Весь цикл ограничен within секундами."""
+    last: Any = None
+
+    async def poll() -> T:
+        nonlocal last
+        while True:
+            last = await check()
+            if last:
+                return last
+            await asyncio.sleep(0.3)
+
+    try:
+        return await asyncio.wait_for(poll(), timeout=within)
+    except TimeoutError:
+        raise AssertionError(f"condition not met within {within}s, last value: {last!r}") from None
 
 
 async def get_payment(api: httpx.AsyncClient, payment_id: str) -> dict[str, Any]:
@@ -85,6 +96,12 @@ async def received_webhooks(receiver: httpx.AsyncClient, payment_id: str) -> lis
     return response.json()
 
 
+async def times_processed(payment_id: str) -> int:
+    """Сколько раз consumer брал в обработку событие этого платежа (по его логу)."""
+    logs = await compose("logs", "--no-color", "consumer")
+    return sum(f"processing payment {payment_id}" in line for line in logs.splitlines())
+
+
 async def dead_lettered(rabbit: httpx.AsyncClient, header: str, value: str) -> list[dict[str, Any]]:
     """Сообщения из payments.dlq с заданным заголовком. Сообщения остаются в очереди."""
     response = await rabbit.post(
@@ -93,6 +110,20 @@ async def dead_lettered(rabbit: httpx.AsyncClient, header: str, value: str) -> l
     )
     response.raise_for_status()
     return [m for m in response.json() if (m["properties"].get("headers") or {}).get(header) == value]
+
+
+async def consumer_subscribed(rabbit: httpx.AsyncClient) -> bool:
+    try:
+        response = await rabbit.get(f"/queues/{VHOST}/payments.new")
+    except httpx.HTTPError:
+        return False
+    return response.status_code == 200 and response.json().get("consumers", 0) > 0
+
+
+async def start_rabbitmq(rabbit: httpx.AsyncClient) -> None:
+    """Запустить брокер и дождаться, пока consumer снова подпишется на очередь."""
+    await compose("start", "rabbitmq")
+    await eventually(lambda: consumer_subscribed(rabbit), within=90)
 
 
 async def publish_raw(

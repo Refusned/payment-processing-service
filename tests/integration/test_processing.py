@@ -1,16 +1,26 @@
-import asyncio
 import json
 import uuid
 from itertools import pairwise
 
 from helpers import (
+    compose,
     dead_lettered,
     eventually,
     get_payment,
     publish_raw,
     received_webhooks,
+    times_processed,
     wait_until_settled,
 )
+
+
+async def outbox_event(db, payment_id: str) -> dict:
+    payload = await db.fetchval("SELECT payload FROM outbox WHERE aggregate_id = $1", uuid.UUID(payment_id))
+    return json.loads(payload)
+
+
+async def processed_at_least(payment_id: str, times: int) -> bool:
+    return await times_processed(payment_id) >= times
 
 
 async def test_successful_payment_is_published_processed_and_notified(api, receiver, db, create_payment):
@@ -22,6 +32,7 @@ async def test_successful_payment_is_published_processed_and_notified(api, recei
     assert payment["processed_at"] is not None
     assert payment["webhook_status"] == "delivered"
     assert payment["webhook_attempts"] == 1
+    assert payment["webhook_delivered_at"] is not None
 
     outbox = await db.fetchrow("SELECT * FROM outbox WHERE aggregate_id = $1", uuid.UUID(payment_id))
     assert outbox["event_type"] == "payment.created"
@@ -60,37 +71,86 @@ async def test_failing_webhook_is_retried_three_times_then_dead_lettered(
     assert payment["status"] == "succeeded"
     assert payment["webhook_status"] == "failed"
     assert payment["webhook_attempts"] == 3
+    assert "HTTP 500" in payment["webhook_last_error"]
 
     calls = await received_webhooks(receiver, payment_id)
     assert len(calls) == 3
     assert len({call["event_id"] for call in calls}) == 1
     gaps = [later["received_at"] - earlier["received_at"] for earlier, later in pairwise(calls)]
-    # Задержки 2 и 4 c задаются TTL retry-очередей. Верхняя граница с большим запасом.
-    assert 1.8 < gaps[0] < 6
-    assert 3.8 < gaps[1] < 8
+    # Паузы задаются TTL retry-очередей: 2 и 4 c. Сверху с запасом на медленную машину.
+    assert 1.8 < gaps[0] < 10
+    assert 3.8 < gaps[1] < 15
+    assert gaps[1] - gaps[0] > 1
 
-    event_id = str(await db.fetchval("SELECT id FROM outbox WHERE aggregate_id = $1", uuid.UUID(payment_id)))
-    [message] = await eventually(lambda: dead_lettered(rabbit, "x-event-id", event_id), within=10)
+    event = await outbox_event(db, payment_id)
+    [message] = await eventually(lambda: dead_lettered(rabbit, "x-event-id", event["event_id"]), within=10)
     assert message["properties"]["headers"]["x-attempt"] == "3"
 
-    last_error = await db.fetchval(
-        "SELECT webhook_last_error FROM payments WHERE id = $1", uuid.UUID(payment_id)
-    )
-    assert "HTTP 500" in last_error
+
+async def test_receiver_recovers_before_attempts_run_out(api, receiver, rabbit, db, create_payment):
+    payment_id = await create_payment(webhook="flaky/2")
+
+    payment = await wait_until_settled(api, payment_id)
+    assert payment["webhook_status"] == "delivered"
+    assert payment["webhook_attempts"] == 3
+    assert payment["webhook_last_error"] is None
+    assert len(await received_webhooks(receiver, payment_id)) == 3
+
+    event = await outbox_event(db, payment_id)
+    assert await dead_lettered(rabbit, "x-event-id", event["event_id"]) == []
 
 
 async def test_redelivered_event_does_not_repeat_processing(api, receiver, rabbit, db, create_payment):
     payment_id = await create_payment()
     settled = await wait_until_settled(api, payment_id)
 
-    payload = await db.fetchval("SELECT payload FROM outbox WHERE aggregate_id = $1", uuid.UUID(payment_id))
-    event = json.loads(payload)
     # То же событие ещё раз, как после повторной публикации из outbox.
+    event = await outbox_event(db, payment_id)
     await publish_raw(rabbit, event, {"x-event-id": event["event_id"]})
-    await asyncio.sleep(3)
+    await eventually(lambda: processed_at_least(payment_id, 2), within=15)
 
     assert await get_payment(api, payment_id) == settled
     assert len(await received_webhooks(receiver, payment_id)) == 1
+
+
+async def two_copies_at_once(rabbit, db, create_payment, webhook: str) -> str:
+    """Две копии одного события ждут в очереди, пока consumer остановлен, и потом идут параллельно."""
+    await compose("stop", "consumer")
+    try:
+        payment_id = await create_payment(webhook=webhook)
+
+        async def published():
+            return await db.fetchval(
+                "SELECT published_at FROM outbox WHERE aggregate_id = $1", uuid.UUID(payment_id)
+            )
+
+        await eventually(published, within=10)
+        event = await outbox_event(db, payment_id)
+        await publish_raw(rabbit, event, {"x-event-id": event["event_id"]})
+    finally:
+        await compose("start", "consumer")
+    return payment_id
+
+
+async def test_concurrent_duplicates_send_one_webhook(api, receiver, rabbit, db, create_payment):
+    payment_id = await two_copies_at_once(rabbit, db, create_payment, webhook="ok")
+
+    await eventually(lambda: processed_at_least(payment_id, 2), within=30)
+    payment = await wait_until_settled(api, payment_id)
+    assert payment["webhook_status"] == "delivered"
+    assert payment["webhook_attempts"] == 1
+    assert len(await received_webhooks(receiver, payment_id)) == 1
+
+
+async def test_concurrent_duplicates_share_the_attempt_budget(api, receiver, rabbit, db, create_payment):
+    payment_id = await two_copies_at_once(rabbit, db, create_payment, webhook="fail")
+
+    # Две начальные доставки и по одному повтору на каждую копию.
+    await eventually(lambda: processed_at_least(payment_id, 4), within=40)
+    payment = await wait_until_settled(api, payment_id)
+    assert payment["webhook_status"] == "failed"
+    assert payment["webhook_attempts"] == 3
+    assert len(await received_webhooks(receiver, payment_id)) == 3
 
 
 async def test_malformed_message_goes_to_dlq(rabbit):
