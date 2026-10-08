@@ -58,21 +58,18 @@ flowchart LR
 У платежа два независимых статуса: результат оплаты и судьба уведомления о нём.
 
 ```mermaid
-stateDiagram-v2
-    direction LR
-    state "Платёж (status)" as payment {
-        [*] --> pending
-        pending --> succeeded: шлюз одобрил, 90%
-        pending --> failed: шлюз отклонил, 10%
-    }
-    state "Уведомление (webhook_status)" as notice {
-        [*] --> wait
-        wait: pending
-        wait --> delivered: ответ 2xx
-        wait --> wait: ошибка, попытки 1 и 2
-        wait --> undelivered: ошибка, попытка 3
-        undelivered: failed, событие в DLQ
-    }
+flowchart TB
+    subgraph payment ["Платёж: status"]
+        direction LR
+        p1(["pending"]) -- "шлюз одобрил, 90%" --> p2(["succeeded"])
+        p1 -- "шлюз отклонил, 10%" --> p3(["failed"])
+    end
+    subgraph notice ["Уведомление: webhook_status"]
+        direction LR
+        w1(["pending"]) -- "ответ 2xx" --> w2(["delivered"])
+        w1 -- "3 ошибки подряд" --> w3(["failed, событие в DLQ"])
+    end
+    payment ~~~ notice
 ```
 
 Как выглядят повторы, если получатель не отвечает:
@@ -94,6 +91,7 @@ sequenceDiagram
     C->>DB: занять попытку 2
     C->>W: POST
     W-->>C: 500
+    C->>DB: следующая не раньше чем через 4 c
     C->>Q: payments.retry.4s
     Note over Q: 4 c
     Q->>C: payments.new
