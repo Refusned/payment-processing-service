@@ -1,0 +1,94 @@
+x-app: &app
+  build: .
+  image: payment-processing-service:local
+  environment: &app-env
+    DATABASE_URL: postgresql+asyncpg://payments:payments@postgres:5432/payments
+    RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+    API_KEY: ${API_KEY:-dev-api-key}
+    GATEWAY_TEST_HOOKS: ${GATEWAY_TEST_HOOKS:-false}
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: payments
+      POSTGRES_PASSWORD: payments
+      POSTGRES_DB: payments
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U payments -d payments"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  rabbitmq:
+    image: rabbitmq:4.3-management-alpine
+    # Данные quorum-очередей привязаны к имени узла (rabbit@<hostname>).
+    # Постоянный hostname сохраняет их при пересоздании контейнера.
+    hostname: rabbitmq
+    ports:
+      - "127.0.0.1:${RABBITMQ_PORT:-5672}:5672"
+      - "127.0.0.1:${RABBITMQ_UI_PORT:-15672}:15672"
+    volumes:
+      - rabbitdata:/var/lib/rabbitmq
+    healthcheck:
+      # Порт AMQP открывается в самом конце загрузки узла. rabbitmq-diagnostics здесь
+      # не подходит: healthcheck идёт от root и на первом старте создаёт .erlang.cookie
+      # раньше брокера, после чего брокер не может его прочитать.
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 5672"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+
+  migrate:
+    <<: *app
+    command: ["alembic", "upgrade", "head"]
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    <<: *app
+    ports:
+      - "127.0.0.1:${API_PORT:-8000}:8000"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      rabbitmq:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import os, urllib.request;
+          urllib.request.urlopen(urllib.request.Request(
+          'http://localhost:8000/health', headers={'X-API-Key': os.environ['API_KEY']}))
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  consumer:
+    <<: *app
+    command: ["faststream", "run", "app.consumer:app"]
+    stop_grace_period: 30s
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      rabbitmq:
+        condition: service_healthy
+
+  webhook-receiver:
+    <<: *app
+    command: ["uvicorn", "tools.webhook_receiver:app", "--host", "0.0.0.0", "--port", "9000"]
+    ports:
+      - "127.0.0.1:${WEBHOOK_RECEIVER_PORT:-9000}:9000"
+
+volumes:
+  pgdata:
+  rabbitdata:
