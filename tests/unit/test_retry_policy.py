@@ -40,7 +40,13 @@ def test_dead_lettering_is_at_least_once(queue):
 
 @pytest.mark.parametrize(
     ("headers", "expected"),
-    [({}, 1), ({"x-attempt": "2"}, 2), ({"x-attempt": 3}, 3), ({"x-attempt": "0"}, 1), ({"x-attempt": "x"}, 1)],
+    [
+        ({}, 1),
+        ({"x-attempt": "2"}, 2),
+        ({"x-attempt": 3}, 3),
+        ({"x-attempt": "0"}, 1),
+        ({"x-attempt": "x"}, 1),
+    ],
 )
 def test_attempt_of(headers, expected):
     assert attempt_of(headers) == expected
