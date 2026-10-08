@@ -1,6 +1,7 @@
 import asyncio
 import uuid
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
 import httpx
@@ -23,6 +24,11 @@ class WebhookEvent:
     body: dict[str, Any]
 
 
+def _iso(value: datetime | None) -> str | None:
+    # Тот же формат, что в ответах API: 2026-10-08T08:37:54.613222Z
+    return value.isoformat().replace("+00:00", "Z") if value else None
+
+
 def payment_event(payment: Payment) -> WebhookEvent:
     event_type = f"payment.{payment.status.value}"
     event_id = uuid.uuid5(EVENT_NAMESPACE, f"{payment.id}:{event_type}")
@@ -36,8 +42,8 @@ def payment_event(payment: Payment) -> WebhookEvent:
         "description": payment.description,
         "metadata": payment.payment_metadata,
         "failure_reason": payment.failure_reason,
-        "created_at": payment.created_at.isoformat(),
-        "processed_at": payment.processed_at.isoformat() if payment.processed_at else None,
+        "created_at": _iso(payment.created_at),
+        "processed_at": _iso(payment.processed_at),
     }
     return WebhookEvent(event_id=event_id, event_type=event_type, body=body)
 
@@ -59,5 +65,7 @@ class WebhookSender:
                     raise WebhookDeliveryError(f"receiver responded with HTTP {response.status_code}")
         except TimeoutError:
             raise WebhookDeliveryError(f"no response within {self._deadline}s") from None
+        except httpx.TimeoutException as exc:
+            raise WebhookDeliveryError(f"{type(exc).__name__}: receiver did not respond in time") from exc
         except httpx.HTTPError as exc:
             raise WebhookDeliveryError(f"{type(exc).__name__}: {exc}") from exc

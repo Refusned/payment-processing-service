@@ -38,8 +38,8 @@ def test_event_body():
         "description": "order #42",
         "metadata": {"order_id": 42},
         "failure_reason": None,
-        "created_at": "2026-10-08T12:00:00+00:00",
-        "processed_at": "2026-10-08T12:00:03+00:00",
+        "created_at": "2026-10-08T12:00:00Z",
+        "processed_at": "2026-10-08T12:00:03Z",
     }
 
 
@@ -84,6 +84,14 @@ async def test_connection_error_is_an_error():
         raise httpx.ConnectError("connection refused", request=request)
 
     with pytest.raises(WebhookDeliveryError, match="ConnectError"):
+        await sender_for(handler).send("http://receiver/hook", payment_event(make_payment()))
+
+
+async def test_timeout_error_has_a_readable_message():
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("", request=request)
+
+    with pytest.raises(WebhookDeliveryError, match="ReadTimeout: receiver did not respond in time"):
         await sender_for(handler).send("http://receiver/hook", payment_event(make_payment()))
 
 

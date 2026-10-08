@@ -7,7 +7,7 @@ cd "$(dirname "$0")/.."
 # Те же порты и ключ, что видит docker compose: переменная окружения, иначе .env, иначе по умолчанию.
 from_env_file() {
   if [ -f .env ]; then
-    sed -n "s/^$1=//p" .env | tail -n1
+    sed -n "s/^$1=//p" .env | tail -n1 | tr -d "\"'"
   fi
 }
 API_PORT="${API_PORT:-$(from_env_file API_PORT)}"

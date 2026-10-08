@@ -6,7 +6,7 @@ from datetime import UTC, datetime, timedelta
 
 from aiormq.exceptions import DeliveryError
 from faststream.rabbit import RabbitBroker
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.config import settings
@@ -25,18 +25,12 @@ MAX_EVENT_BACKOFF = 60
 MAX_LOOP_BACKOFF = 30
 CONNECT_TIMEOUT = 30
 # Цикл обновляет heartbeat на каждой итерации. Если он молчит дольше, релей считается зависшим.
-STALL_AFTER = 60
+STALL_AFTER = 90
 
 
 class OutboxRelay:
-    """Переносит события из таблицы outbox в RabbitMQ.
-
-    Событие помечается опубликованным только после подтверждения брокера и в той же
-    транзакции, которая держит строку. Падение между подтверждением и коммитом
-    приведёт к повторной публикации: гарантия at-least-once, consumer к дублям готов.
-
-    Подключение к брокеру тоже делает релей, с повторами. Поэтому api стартует и принимает
-    платежи, даже если RabbitMQ в этот момент недоступен.
+    """Переносит события из outbox в RabbitMQ. published_at ставится только после подтверждения
+    брокера, поэтому падение между ними даёт повторную публикацию, а не потерю (at-least-once).
     """
 
     def __init__(self, broker: RabbitBroker, session_factory: async_sessionmaker[AsyncSession]) -> None:
@@ -90,7 +84,9 @@ class OutboxRelay:
             events = (
                 await session.scalars(
                     select(OutboxEvent)
-                    .where(OutboxEvent.published_at.is_(None), OutboxEvent.next_attempt_at <= func.now())
+                    .where(
+                        OutboxEvent.published_at.is_(None), OutboxEvent.next_attempt_at <= datetime.now(UTC)
+                    )
                     .order_by(OutboxEvent.created_at)
                     .limit(settings.outbox_batch_size)
                     .with_for_update(skip_locked=True)

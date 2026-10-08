@@ -2,6 +2,7 @@ import asyncio
 import logging
 
 import httpx
+from aio_pika.abc import HeadersType
 from faststream import FastStream
 from faststream.exceptions import NackMessage, RejectMessage
 from faststream.rabbit import RabbitMessage
@@ -12,12 +13,14 @@ from app.gateway import EmulatedGateway
 from app.messaging import (
     ATTEMPT_HEADER,
     EVENT_ID_HEADER,
+    INFRA_RETRIES_HEADER,
     MAX_ATTEMPTS,
+    MAX_INFRA_RETRIES,
     RETRY_DELAYS,
-    attempt_of,
     build_broker,
     declare_topology,
     exchange,
+    header_int,
     new_queue,
     reliable_publish,
     retry_queue_for,
@@ -59,14 +62,12 @@ async def close_resources() -> None:
     await engine.dispose()
 
 
-# Политика подтверждения по умолчанию (REJECT_ON_ERROR): успешный выход из обработчика
-# даёт ack, RejectMessage и любое необработанное исключение дают reject без requeue,
-# и брокер переносит сообщение в payments.dlq. Сюда же попадает сообщение, которое
-# не разобралось в PaymentCreatedEvent.
+# REJECT_ON_ERROR (по умолчанию): выход из обработчика даёт ack, RejectMessage и исключение
+# дают reject, и сообщение уходит в payments.dlq. Туда же попадает тело, которое не разобралось.
 @broker.subscriber(new_queue, exchange)
 async def handle_payment_created(event: PaymentCreatedEvent, message: RabbitMessage) -> None:
     payment_id = event.payment_id
-    attempt = attempt_of(message.headers)
+    attempt = header_int(message.headers, ATTEMPT_HEADER, 1)
     logger.info("processing payment %s, event %s", payment_id, event.event_id)
     try:
         outcome = await processor.process(payment_id)
@@ -74,12 +75,14 @@ async def handle_payment_created(event: PaymentCreatedEvent, message: RabbitMess
         logger.error("payment %s not found, event %s goes to DLQ", payment_id, event.event_id)
         raise RejectMessage() from None
     except Exception as exc:
-        # До записи результата дело не дошло (например, недоступна БД): повторяем по заголовку.
+        # До решения о доставке дело не дошло (например, недоступна БД). Попытки доставки
+        # на это не тратим, ждём восстановления со своим лимитом.
         logger.exception("payment %s: processing failed", payment_id)
-        if attempt >= MAX_ATTEMPTS:
+        retries = header_int(message.headers, INFRA_RETRIES_HEADER, 0)
+        if retries >= MAX_INFRA_RETRIES:
             logger.error("payment %s: %s, event %s goes to DLQ", payment_id, exc, event.event_id)
             raise RejectMessage() from None
-        await _wake_up_later(event, RETRY_DELAYS[attempt - 1], attempt + 1)
+        await _wake_up_later(event, RETRY_DELAYS[-1], attempt, infra_retries=retries + 1)
         return
 
     match outcome:
@@ -110,18 +113,20 @@ async def handle_payment_created(event: PaymentCreatedEvent, message: RabbitMess
             await _wake_up_later(event, delay, failed + 1)
 
 
-async def _wake_up_later(event: PaymentCreatedEvent, delay: float, attempt: int) -> None:
+async def _wake_up_later(
+    event: PaymentCreatedEvent, delay: float, attempt: int, infra_retries: int = 0
+) -> None:
     """Вернуть событие в обработку не раньше чем через delay секунд, через retry-очередь."""
     queue = retry_queue_for(delay)
+    headers: HeadersType = {
+        ATTEMPT_HEADER: str(attempt),
+        EVENT_ID_HEADER: str(event.event_id),
+        INFRA_RETRIES_HEADER: str(infra_retries),
+    }
     try:
         # Сначала подтверждённая публикация копии, потом ack оригинала (выходом из обработчика).
         # Падение между ними даст дубль, а не потерю.
-        await reliable_publish(
-            broker,
-            event.model_dump(mode="json"),
-            queue.routing_key,
-            {ATTEMPT_HEADER: str(attempt), EVENT_ID_HEADER: str(event.event_id)},
-        )
+        await reliable_publish(broker, event.model_dump(mode="json"), queue.routing_key, headers)
     except Exception:
         # Возвращаем сообщение в очередь. Это не новая попытка: время следующей записано
         # в БД, и раньше него запрос к получателю не уйдёт.

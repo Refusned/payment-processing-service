@@ -8,9 +8,8 @@ class Settings(BaseSettings):
     # allow_inf_nan: иначе "Infinity" в переменной окружения снимет любой таймаут.
     model_config = SettingsConfigDict(env_file=".env", extra="ignore", allow_inf_nan=False)
 
-    database_url: str = "postgresql+asyncpg://payments:payments@localhost:5432/payments"
-    rabbitmq_url: str = "amqp://guest:guest@localhost:5672/"
-    # Печатный ASCII: значение HTTP-заголовка, другие символы клиент не передаст как есть.
+    database_url: str = "postgresql+asyncpg://payments:payments@localhost:55432/payments"
+    rabbitmq_url: str = "amqp://guest:guest@localhost:55672/"
     api_key: str = Field(min_length=1, pattern=r"^[\x21-\x7e]+$")
     # ТЗ требует ключ на всех эндпоинтах, поэтому Swagger по умолчанию выключен.
     docs_enabled: bool = False
@@ -27,13 +26,11 @@ class Settings(BaseSettings):
     gateway_min_delay: float = Field(default=2.0, ge=0)
     gateway_max_delay: float = Field(default=5.0, ge=0)
     gateway_success_rate: float = Field(default=0.9, ge=0, le=1)
-    # Разрешает задавать исход и задержку эмулятора через metadata платежа.
-    # Включается только в тестовом окружении.
+    # Исход и задержка эмулятора из metadata платежа, только для тестов.
     gateway_test_hooks: bool = False
 
     webhook_connect_timeout: float = Field(default=2.0, gt=0)
     webhook_read_timeout: float = Field(default=5.0, gt=0)
-    # Общий лимит на запрос: read timeout сам по себе не ограничивает медленную отдачу ответа.
     webhook_deadline: float = Field(default=10.0, gt=0)
 
     @model_validator(mode="after")

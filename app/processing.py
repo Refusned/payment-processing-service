@@ -1,3 +1,4 @@
+import logging
 import uuid
 from dataclasses import dataclass
 from datetime import timedelta
@@ -9,6 +10,8 @@ from app.gateway import ChargeResult, PaymentGateway
 from app.messaging import MAX_ATTEMPTS, RETRY_DELAYS
 from app.models import Payment, PaymentStatus, WebhookStatus
 from app.webhooks import WebhookDeliveryError, WebhookSender, payment_event
+
+logger = logging.getLogger(__name__)
 
 
 class PaymentNotFound(Exception):
@@ -45,15 +48,8 @@ Outcome = Delivered | GaveUp | NotDue | AttemptFailed
 
 
 class PaymentProcessor:
-    """Доводит платёж до финального результата и уведомляет клиента.
-
-    Одно событие может прийти несколько раз, в том числе одновременно (outbox публикует
-    at-least-once). Результат эмулятора фиксируется условным UPDATE ровно один раз.
-
-    Расписание доставки webhook хранится в строке платежа: счётчик попыток и время,
-    раньше которого следующая попытка не начнётся. Попытка резервируется коротким
-    коммитом до HTTP-запроса, поэтому её не откатит сбой базы после ответа получателя,
-    а копия события, пришедшая раньше времени, получает NotDue и ждёт в retry-очереди.
+    """Доводит платёж до результата и уведомляет клиента. Безопасен для повторной доставки события:
+    результат эмулятора пишется один раз, расписание попыток webhook хранится в строке платежа.
     """
 
     def __init__(
@@ -174,7 +170,7 @@ class PaymentProcessor:
 
     async def _record_delivery(self, payment_id: uuid.UUID) -> None:
         async with self._session_factory() as session, session.begin():
-            await session.execute(
+            result = await session.execute(
                 update(Payment)
                 .where(Payment.id == payment_id, Payment.webhook_status == WebhookStatus.PENDING)
                 .values(
@@ -185,3 +181,6 @@ class PaymentProcessor:
                     updated_at=func.now(),
                 )
             )
+        if result.rowcount == 0:  # type: ignore[attr-defined]
+            # Запрос шёл дольше срока попытки, и другая копия события уже завершила доставку.
+            logger.warning("payment %s: webhook delivered after the attempt lease expired", payment_id)

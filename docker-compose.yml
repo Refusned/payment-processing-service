@@ -19,7 +19,8 @@ services:
       POSTGRES_PASSWORD: payments
       POSTGRES_DB: payments
     ports:
-      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+      # Нестандартный порт на хосте, чтобы не столкнуться с локальным PostgreSQL.
+      - "127.0.0.1:${POSTGRES_PORT:-55432}:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -34,7 +35,7 @@ services:
     # Постоянный hostname сохраняет их при пересоздании контейнера.
     hostname: rabbitmq
     ports:
-      - "127.0.0.1:${RABBITMQ_PORT:-5672}:5672"
+      - "127.0.0.1:${RABBITMQ_PORT:-55672}:5672"
       - "127.0.0.1:${RABBITMQ_UI_PORT:-15672}:15672"
     volumes:
       - rabbitdata:/var/lib/rabbitmq

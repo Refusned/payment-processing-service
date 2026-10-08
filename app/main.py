@@ -6,6 +6,7 @@ from fastapi import Depends, FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from sqlalchemy import text
+from sqlalchemy.exc import DBAPIError
 
 from app.api import SessionDep, require_api_key, router
 from app.config import settings
@@ -40,6 +41,15 @@ app = FastAPI(
     openapi_url="/openapi.json" if settings.docs_enabled else None,
 )
 app.include_router(router)
+
+
+@app.exception_handler(DBAPIError)
+@app.exception_handler(OSError)
+async def database_unavailable(request: Request, exc: Exception) -> JSONResponse:
+    logger.warning("database is unavailable: %s: %s", type(exc).__name__, exc)
+    return JSONResponse(
+        {"detail": "Database is unavailable, retry later"}, status_code=503, headers={"Retry-After": "5"}
+    )
 
 
 @app.exception_handler(RequestValidationError)

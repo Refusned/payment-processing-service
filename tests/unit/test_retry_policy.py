@@ -2,8 +2,8 @@ import pytest
 
 from app.messaging import (
     MAX_ATTEMPTS,
-    attempt_of,
     dead_letter_queue,
+    header_int,
     new_queue,
     retry_queue_for,
     retry_queues,
@@ -52,5 +52,5 @@ def test_dead_lettering_is_at_least_once(queue):
         ({"x-attempt": "x"}, 1),
     ],
 )
-def test_attempt_of(headers, expected):
-    assert attempt_of(headers) == expected
+def test_header_int(headers, expected):
+    assert header_int(headers, "x-attempt", 1) == expected

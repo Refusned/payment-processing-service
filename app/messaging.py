@@ -30,12 +30,16 @@ from app.config import settings
 
 ATTEMPT_HEADER = "x-attempt"
 EVENT_ID_HEADER = "x-event-id"
+# Сколько раз подряд обработка упала до решения о доставке (недоступна БД и т.п.).
+INFRA_RETRIES_HEADER = "x-infra-retries"
 
 NEW_ROUTING_KEY = "payments.new"
 DLQ_ROUTING_KEY = "payments.dlq"
 
 RETRY_DELAYS = (2, 4)
 MAX_ATTEMPTS = len(RETRY_DELAYS) + 1
+# Ошибки инфраструктуры не тратят попытки доставки: событие ждёт по 4 c, всего около двух минут.
+MAX_INFRA_RETRIES = 30
 
 exchange = RabbitExchange("payments", type=ExchangeType.DIRECT, durable=True)
 dead_letter_exchange = RabbitExchange("payments.dlx", type=ExchangeType.DIRECT, durable=True)
@@ -101,11 +105,11 @@ async def declare_topology(broker: RabbitBroker) -> None:
     await declared.bind(dlx, routing_key=DLQ_ROUTING_KEY)
 
 
-def attempt_of(headers: Mapping[str, Any]) -> int:
+def header_int(headers: Mapping[str, Any], name: str, default: int) -> int:
     try:
-        return max(int(headers.get(ATTEMPT_HEADER, 1)), 1)
+        return max(int(headers.get(name, default)), default)
     except (TypeError, ValueError):
-        return 1
+        return default
 
 
 def retry_queue_for(delay: float) -> RabbitQueue:
@@ -135,8 +139,6 @@ async def reliable_publish(
             headers=headers,
             persist=True,
             mandatory=True,
-            # Транспортный id уникален на каждую публикацию: aiormq сопоставляет возвраты
-            # по message_id и путает одновременные публикации с одинаковым id.
-            # Стабильный id события едет в заголовке x-event-id.
+            # Уникален на публикацию: aiormq сопоставляет Basic.Return по message_id.
             message_id=uuid.uuid4().hex,
         )

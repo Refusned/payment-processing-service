@@ -1,4 +1,5 @@
 import asyncio
+import os
 from logging.config import fileConfig
 
 from sqlalchemy import pool
@@ -6,7 +7,6 @@ from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from alembic import context
-from app.config import settings
 from app.models import Base
 
 config = context.config
@@ -14,11 +14,15 @@ if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
 target_metadata = Base.metadata
+# Миграциям нужен только адрес базы. app.config не импортируем: он требует API_KEY.
+database_url = os.environ.get(
+    "DATABASE_URL", "postgresql+asyncpg://payments:payments@localhost:55432/payments"
+)
 
 
 def run_migrations_offline() -> None:
     context.configure(
-        url=settings.database_url,
+        url=database_url,
         target_metadata=target_metadata,
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
@@ -34,7 +38,7 @@ def do_run_migrations(connection: Connection) -> None:
 
 
 async def run_migrations_online() -> None:
-    engine = create_async_engine(settings.database_url, poolclass=pool.NullPool)
+    engine = create_async_engine(database_url, poolclass=pool.NullPool)
     async with engine.connect() as connection:
         await connection.run_sync(do_run_migrations)
     await engine.dispose()

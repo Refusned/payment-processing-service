@@ -1,5 +1,6 @@
 """Отказы инфраструктуры: брокер недоступен, маршрут пропал, consumer убит посреди обработки."""
 
+import asyncio
 import uuid
 from itertools import pairwise
 
@@ -11,6 +12,7 @@ from helpers import (
     dead_lettered,
     eventually,
     get_payment,
+    payment_body,
     received_webhooks,
     start_rabbitmq,
     times_processed,
@@ -64,6 +66,34 @@ async def test_api_starts_without_broker(api, rabbit, db, create_payment):
 
     payment = await wait_until_settled(api, payment_id, within=120)
     assert payment["webhook_status"] == "delivered"
+
+
+async def test_database_outage_does_not_spend_delivery_attempts(api, receiver, create_payment):
+    payment_id = await create_payment(delay=3)
+    await eventually(lambda: times_processed(payment_id), within=15)
+
+    # Пока consumer ждёт ответа шлюза, база пропадает примерно на 15 c.
+    await compose("stop", "postgres")
+    try:
+        response = await api.post(
+            "/api/v1/payments", json=payment_body(), headers={"Idempotency-Key": str(uuid.uuid4())}
+        )
+        assert response.status_code == 503
+        assert response.headers["retry-after"]
+        await asyncio.sleep(12)
+    finally:
+        await compose("start", "postgres")
+
+        async def healthy():
+            return (await api.get("/health")).status_code == 200
+
+        await eventually(healthy, within=60)
+
+    payment = await wait_until_settled(api, payment_id, within=90)
+    assert payment["status"] == "succeeded"
+    assert payment["webhook_status"] == "delivered"
+    assert payment["webhook_attempts"] == 1
+    assert len(await received_webhooks(receiver, payment_id)) == 1
 
 
 async def test_unroutable_event_is_not_marked_as_published(api, rabbit, db, create_payment):
