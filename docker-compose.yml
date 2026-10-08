@@ -1,19 +1,20 @@
 x-app: &app
   build: .
   image: payment-processing-service:local
-  # Остальные настройки приложения (см. README) можно задать в .env.
-  env_file:
-    - path: .env
-      required: false
   environment:
     DATABASE_URL: postgresql+asyncpg://payments:payments@postgres:5432/payments
     RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
     API_KEY: ${API_KEY:-dev-api-key}
+    DOCS_ENABLED: ${DOCS_ENABLED:-false}
+    CONSUMER_PREFETCH: ${CONSUMER_PREFETCH:-10}
+    GATEWAY_MIN_DELAY: ${GATEWAY_MIN_DELAY:-2}
+    GATEWAY_MAX_DELAY: ${GATEWAY_MAX_DELAY:-5}
+    GATEWAY_SUCCESS_RATE: ${GATEWAY_SUCCESS_RATE:-0.9}
     GATEWAY_TEST_HOOKS: ${GATEWAY_TEST_HOOKS:-false}
 
 services:
   postgres:
-    image: postgres:16-alpine
+    image: postgres:16.15-alpine
     environment:
       POSTGRES_USER: payments
       POSTGRES_PASSWORD: payments
@@ -29,7 +30,7 @@ services:
       retries: 30
 
   rabbitmq:
-    image: rabbitmq:4.3-management-alpine
+    image: rabbitmq:4.3.6-management-alpine
     # Данные quorum-очередей привязаны к имени узла (rabbit@<hostname>).
     # Постоянный hostname сохраняет их при пересоздании контейнера.
     hostname: rabbitmq
@@ -57,6 +58,7 @@ services:
 
   api:
     <<: *app
+    restart: unless-stopped
     ports:
       - "127.0.0.1:${API_PORT:-8000}:8000"
     depends_on:
@@ -79,6 +81,7 @@ services:
 
   consumer:
     <<: *app
+    restart: unless-stopped
     command: ["faststream", "run", "app.consumer:app"]
     stop_grace_period: 30s
     depends_on:
@@ -89,9 +92,15 @@ services:
 
   webhook-receiver:
     <<: *app
+    restart: unless-stopped
     command: ["uvicorn", "tools.webhook_receiver:app", "--host", "0.0.0.0", "--port", "9000"]
     ports:
       - "127.0.0.1:${WEBHOOK_RECEIVER_PORT:-9000}:9000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9000/received')"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
 
 volumes:
   pgdata:

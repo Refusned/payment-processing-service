@@ -33,4 +33,6 @@ jobs:
       - run: $TEST_COMPOSE up -d --build --wait
       - run: pytest tests/integration -v
       - if: failure()
-        run: $TEST_COMPOSE logs api consumer rabbitmq
+        run: |
+          $TEST_COMPOSE ps -a
+          $TEST_COMPOSE logs --no-color

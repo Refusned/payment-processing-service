@@ -23,6 +23,7 @@ test-unit:
 	pytest tests/unit
 
 # Отдельный compose-проект со своими портами и томами, рабочий стек не трогает.
+# Параллельно два прогона не запускать: у них общее имя проекта и порты.
 test-integration:
-	$(TEST_COMPOSE) up -d --build --wait
-	pytest tests/integration -v; status=$$?; $(TEST_COMPOSE) down -v; exit $$status
+	@trap '$(TEST_COMPOSE) down -v' EXIT; \
+	$(TEST_COMPOSE) up -d --build --wait && pytest tests/integration -v
