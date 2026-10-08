@@ -1,11 +1,14 @@
 """Отказы инфраструктуры: брокер недоступен, маршрут пропал, consumer убит посреди обработки."""
 
 import uuid
+from itertools import pairwise
 
 from helpers import (
     VHOST,
     compose,
     consumer_subscribed,
+    copies_finished,
+    dead_lettered,
     eventually,
     get_payment,
     received_webhooks,
@@ -78,20 +81,33 @@ async def test_unroutable_event_is_not_marked_as_published(api, rabbit, db, crea
     assert payment["status"] == "succeeded"
 
 
-async def test_failed_retry_publish_does_not_add_attempts(api, receiver, rabbit, create_payment):
-    # Первый повтор опубликовать некуда. Сообщение возвращается в очередь, но попытка
-    # уже учтена в БД, поэтому всего обращений к получателю всё равно три.
+async def test_failed_retry_publish_keeps_attempts_and_pauses(api, receiver, rabbit, db, create_payment):
+    # Очередь первого повтора недоступна: сообщение возвращается в рабочую очередь сразу,
+    # но время следующей попытки записано в БД, и раньше него запрос к получателю не уйдёт.
     binding = f"/bindings/{VHOST}/e/payments/q/payments.retry.2s"
     (await rabbit.delete(f"{binding}/payments.retry.2s")).raise_for_status()
     try:
         payment_id = await create_payment(webhook="fail")
-        payment = await wait_until_settled(api, payment_id, within=40)
+
+        async def gave_up():
+            return await copies_finished(payment_id) >= 1
+
+        await eventually(gave_up, within=40)
     finally:
         (await rabbit.post(binding, json={"routing_key": "payments.retry.2s"})).raise_for_status()
 
+    payment = await get_payment(api, payment_id)
     assert payment["webhook_status"] == "failed"
     assert payment["webhook_attempts"] == 3
-    assert len(await received_webhooks(receiver, payment_id)) == 3
+
+    calls = await received_webhooks(receiver, payment_id)
+    assert len(calls) == 3
+    first, second = (b["received_at"] - a["received_at"] for a, b in pairwise(calls))
+    assert first > 1.8
+    assert second > 3.8
+
+    event_id = str(await db.fetchval("SELECT id FROM outbox WHERE aggregate_id = $1", uuid.UUID(payment_id)))
+    assert len(await dead_lettered(rabbit, "x-event-id", event_id)) == 1
 
 
 async def test_consumer_crash_during_processing(api, receiver, rabbit, create_payment):

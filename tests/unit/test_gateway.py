@@ -43,16 +43,20 @@ async def test_hooks_force_the_outcome():
 
 
 async def test_default_settings_match_the_task(monkeypatch):
+    for name in ("GATEWAY_MIN_DELAY", "GATEWAY_MAX_DELAY", "GATEWAY_SUCCESS_RATE"):
+        monkeypatch.delenv(name, raising=False)
     delays = []
 
     async def fake_sleep(seconds):
         delays.append(seconds)
 
     monkeypatch.setattr("app.gateway.asyncio.sleep", fake_sleep)
-    gw = EmulatedGateway.from_settings(Settings(api_key="x"))
+    gw = EmulatedGateway.from_settings(Settings(api_key="x", _env_file=None))
     results = [await gw.charge(payment()) for _ in range(2000)]
 
-    assert min(delays) >= 2 and max(delays) <= 5
+    # Задержки заполняют весь диапазон 2-5 c, а не его часть.
+    assert 2 <= min(delays) < 2.1
+    assert 4.9 < max(delays) <= 5
     assert 0.87 < sum(r.succeeded for r in results) / len(results) < 0.93
 
 
@@ -60,12 +64,14 @@ async def test_default_settings_match_the_task(monkeypatch):
     "overrides",
     [
         {"api_key": ""},
-        {"gateway_min_delay": 6},
+        {"api_key": "ключ"},
+        {"gateway_min_delay": 6, "gateway_max_delay": 5},
         {"gateway_success_rate": 1.5},
         {"outbox_batch_size": 0},
         {"consumer_prefetch": 0},
+        {"webhook_deadline": float("inf")},
     ],
 )
 def test_invalid_settings_are_rejected(overrides):
     with pytest.raises(ValueError):
-        Settings(**{"api_key": "x", **overrides})
+        Settings(**{"api_key": "x", "_env_file": None, **overrides})

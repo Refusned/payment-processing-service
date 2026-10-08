@@ -89,6 +89,8 @@ class Payment(Base):
     )
     webhook_attempts: Mapped[int] = mapped_column(Integer, server_default="0")
     webhook_last_error: Mapped[str | None] = mapped_column(Text)
+    # Раньше этого времени следующая попытка не начнётся: пауза после ошибки или срок идущей попытки.
+    webhook_next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     webhook_delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

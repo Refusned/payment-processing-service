@@ -96,10 +96,23 @@ async def received_webhooks(receiver: httpx.AsyncClient, payment_id: str) -> lis
     return response.json()
 
 
-async def times_processed(payment_id: str) -> int:
-    """Сколько раз consumer брал в обработку событие этого платежа (по его логу)."""
+async def consumer_log(payment_id: str) -> list[str]:
     logs = await compose("logs", "--no-color", "consumer")
-    return sum(f"processing payment {payment_id}" in line for line in logs.splitlines())
+    return [line for line in logs.splitlines() if payment_id in line]
+
+
+async def times_processed(payment_id: str) -> int:
+    """Сколько раз consumer брал в обработку событие этого платежа."""
+    return sum("processing payment" in line for line in await consumer_log(payment_id))
+
+
+# Строки лога consumer, после которых сообщение подтверждено или отклонено окончательно.
+FINAL_OUTCOMES = ("webhook delivered", "webhook already delivered", "goes to DLQ")
+
+
+async def copies_finished(payment_id: str) -> int:
+    """Сколько копий события этого платежа обработано до конца."""
+    return sum(any(o in line for o in FINAL_OUTCOMES) for line in await consumer_log(payment_id))
 
 
 async def dead_lettered(rabbit: httpx.AsyncClient, header: str, value: str) -> list[dict[str, Any]]:

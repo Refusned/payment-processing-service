@@ -4,12 +4,15 @@
 set -eu
 cd "$(dirname "$0")/.."
 
-# Те же порты и ключ, что видит docker compose.
-if [ -f .env ]; then
-  set -a
-  . ./.env
-  set +a
-fi
+# Те же порты и ключ, что видит docker compose: переменная окружения, иначе .env, иначе по умолчанию.
+from_env_file() {
+  if [ -f .env ]; then
+    sed -n "s/^$1=//p" .env | tail -n1
+  fi
+}
+API_PORT="${API_PORT:-$(from_env_file API_PORT)}"
+WEBHOOK_RECEIVER_PORT="${WEBHOOK_RECEIVER_PORT:-$(from_env_file WEBHOOK_RECEIVER_PORT)}"
+API_KEY="${API_KEY:-$(from_env_file API_KEY)}"
 
 API="http://127.0.0.1:${API_PORT:-8000}"
 RECEIVER="http://127.0.0.1:${WEBHOOK_RECEIVER_PORT:-9000}"
@@ -44,7 +47,7 @@ echo "$replay" | grep -qi '^idempotent-replayed: true' || fail "no Idempotent-Re
 echo "$replay" | grep -q "\"payment_id\":\"$payment_id\"" || fail "replay returned a different payment"
 
 echo
-echo "== Waiting for processing (2-5 s)"
+echo "== Waiting for processing (2-5 s, up to 20 checks)"
 payment=""
 for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
   payment=$(curl -fsS --max-time 10 "$API/api/v1/payments/$payment_id" -H "X-API-Key: $KEY")
@@ -56,7 +59,7 @@ done
 echo "$payment"
 case "$payment" in
   *'"webhook_status":"delivered"'*) ;;
-  *) fail "webhook was not delivered within 20 s" ;;
+  *) fail "webhook was not delivered" ;;
 esac
 
 echo

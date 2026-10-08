@@ -13,22 +13,23 @@ from app.messaging import (
     ATTEMPT_HEADER,
     EVENT_ID_HEADER,
     MAX_ATTEMPTS,
+    RETRY_DELAYS,
     attempt_of,
     build_broker,
     declare_topology,
     exchange,
     new_queue,
     reliable_publish,
-    retry_queue_after,
+    retry_queue_for,
 )
-from app.processing import PaymentNotFound, PaymentProcessor, WebhookAttemptFailed
+from app.processing import AttemptFailed, Delivered, GaveUp, NotDue, PaymentNotFound, PaymentProcessor
 from app.schemas import PaymentCreatedEvent
 from app.webhooks import WebhookSender
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("app.consumer")
 
-# Самая долгая попытка: шлюз 5 c, webhook 10 c, публикация повтора 5 c.
+# Самая долгая обработка: шлюз 5 c, webhook 10 c, публикация повтора 5 c.
 broker = build_broker(prefetch=settings.consumer_prefetch, graceful_timeout=25)
 app = FastStream(broker)
 
@@ -40,14 +41,16 @@ processor = PaymentProcessor(
     session_factory,
     EmulatedGateway.from_settings(settings),
     WebhookSender(http_client, settings.webhook_deadline),
+    attempt_lease=settings.webhook_deadline + 5,
 )
 
 
 @app.on_startup
 async def setup_topology() -> None:
     # Retry-очереди и DLQ должны существовать до того, как подписчик возьмёт первое сообщение.
-    await broker.connect()
-    await declare_topology(broker)
+    async with asyncio.timeout(30):
+        await broker.connect()
+        await declare_topology(broker)
 
 
 @app.after_shutdown
@@ -62,54 +65,66 @@ async def close_resources() -> None:
 # не разобралось в PaymentCreatedEvent.
 @broker.subscriber(new_queue, exchange)
 async def handle_payment_created(event: PaymentCreatedEvent, message: RabbitMessage) -> None:
-    logger.info("processing payment %s, event %s", event.payment_id, event.event_id)
+    payment_id = event.payment_id
+    attempt = attempt_of(message.headers)
+    logger.info("processing payment %s, event %s", payment_id, event.event_id)
     try:
-        await processor.process(event.payment_id)
+        outcome = await processor.process(payment_id)
     except PaymentNotFound:
-        logger.error("payment %s not found, event %s goes to DLQ", event.payment_id, event.event_id)
+        logger.error("payment %s not found, event %s goes to DLQ", payment_id, event.event_id)
         raise RejectMessage() from None
-    except WebhookAttemptFailed as exc:
-        # Номер попытки берётся из БД: его делят все копии события.
-        await _retry_or_reject(event, exc.attempt, str(exc))
     except Exception as exc:
-        # До попытки доставки не дошли (например, недоступна БД): считаем по заголовку сообщения.
-        logger.exception("payment %s: processing failed", event.payment_id)
-        await _retry_or_reject(event, attempt_of(message.headers), f"{type(exc).__name__}: {exc}")
+        # До записи результата дело не дошло (например, недоступна БД): повторяем по заголовку.
+        logger.exception("payment %s: processing failed", payment_id)
+        if attempt >= MAX_ATTEMPTS:
+            logger.error("payment %s: %s, event %s goes to DLQ", payment_id, exc, event.event_id)
+            raise RejectMessage() from None
+        await _wake_up_later(event, RETRY_DELAYS[attempt - 1], attempt + 1)
+        return
+
+    match outcome:
+        case Delivered(already=False):
+            logger.info("payment %s: webhook delivered", payment_id)
+        case Delivered(already=True):
+            logger.info("payment %s: webhook already delivered, duplicate event acked", payment_id)
+        case GaveUp(error=error):
+            logger.error(
+                "payment %s: webhook not delivered (%s), event %s goes to DLQ",
+                payment_id,
+                error,
+                event.event_id,
+            )
+            raise RejectMessage()
+        case NotDue(delay=delay):
+            logger.info("payment %s: next webhook attempt is not due yet, waiting %.1fs", payment_id, delay)
+            await _wake_up_later(event, delay, attempt)
+        case AttemptFailed(attempt=failed, error=error, retry_in=delay):
+            logger.warning(
+                "payment %s: webhook attempt %d/%d failed (%s), next in %ss",
+                payment_id,
+                failed,
+                MAX_ATTEMPTS,
+                error,
+                delay,
+            )
+            await _wake_up_later(event, delay, failed + 1)
 
 
-async def _retry_or_reject(event: PaymentCreatedEvent, attempt: int, error: str) -> None:
-    retry_queue = retry_queue_after(attempt)
-    if retry_queue is None:
-        logger.error(
-            "payment %s: attempt %d/%d failed (%s), event %s goes to DLQ",
-            event.payment_id,
-            attempt,
-            MAX_ATTEMPTS,
-            error,
-            event.event_id,
-        )
-        raise RejectMessage()
-
-    logger.warning(
-        "payment %s: attempt %d/%d failed (%s), retrying via %s",
-        event.payment_id,
-        attempt,
-        MAX_ATTEMPTS,
-        error,
-        retry_queue.name,
-    )
+async def _wake_up_later(event: PaymentCreatedEvent, delay: float, attempt: int) -> None:
+    """Вернуть событие в обработку не раньше чем через delay секунд, через retry-очередь."""
+    queue = retry_queue_for(delay)
     try:
         # Сначала подтверждённая публикация копии, потом ack оригинала (выходом из обработчика).
         # Падение между ними даст дубль, а не потерю.
         await reliable_publish(
             broker,
             event.model_dump(mode="json"),
-            retry_queue.routing_key,
-            {ATTEMPT_HEADER: str(attempt + 1), EVENT_ID_HEADER: str(event.event_id)},
+            queue.routing_key,
+            {ATTEMPT_HEADER: str(attempt), EVENT_ID_HEADER: str(event.event_id)},
         )
     except Exception:
-        # Повтор не запланирован, возвращаем сообщение в очередь. Попытка доставки уже
-        # учтена в БД, поэтому повторная доставка не увеличит общее число обращений.
-        logger.exception("could not schedule retry for payment %s, requeueing", event.payment_id)
+        # Возвращаем сообщение в очередь. Это не новая попытка: время следующей записано
+        # в БД, и раньше него запрос к получателю не уйдёт.
+        logger.exception("could not schedule payment %s via %s, requeueing", event.payment_id, queue.name)
         await asyncio.sleep(1)
         raise NackMessage() from None

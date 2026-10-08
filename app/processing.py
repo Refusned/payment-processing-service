@@ -1,11 +1,12 @@
 import uuid
-from datetime import UTC, datetime
+from dataclasses import dataclass
+from datetime import timedelta
 
 from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.gateway import ChargeResult, PaymentGateway
-from app.messaging import MAX_ATTEMPTS
+from app.messaging import MAX_ATTEMPTS, RETRY_DELAYS
 from app.models import Payment, PaymentStatus, WebhookStatus
 from app.webhooks import WebhookDeliveryError, WebhookSender, payment_event
 
@@ -14,22 +15,45 @@ class PaymentNotFound(Exception):
     pass
 
 
-class WebhookAttemptFailed(Exception):
-    """Попытка доставки не удалась и уже учтена в БД."""
+@dataclass(frozen=True)
+class Delivered:
+    already: bool = False
 
-    def __init__(self, attempt: int, error: str) -> None:
-        super().__init__(error)
-        self.attempt = attempt
+
+@dataclass(frozen=True)
+class GaveUp:
+    """Попытки доставки исчерпаны, событие должно уйти в DLQ."""
+
+    error: str | None
+
+
+@dataclass(frozen=True)
+class NotDue:
+    """Следующую попытку начинать рано: идёт пауза после ошибки или чужая попытка."""
+
+    delay: float
+
+
+@dataclass(frozen=True)
+class AttemptFailed:
+    attempt: int
+    error: str
+    retry_in: float
+
+
+Outcome = Delivered | GaveUp | NotDue | AttemptFailed
 
 
 class PaymentProcessor:
-    """Доводит платёж до финального статуса и уведомляет клиента.
+    """Доводит платёж до финального результата и уведомляет клиента.
 
-    Обработчик может получить одно событие дважды (outbox публикует at-least-once).
-    Списание фиксируется условным UPDATE, так что статус меняется ровно один раз.
-    Webhook отправляется под блокировкой строки платежа, а счётчик попыток хранится
-    в той же строке: параллельные дубли отправляют по очереди и делят общий бюджет
-    из MAX_ATTEMPTS попыток.
+    Одно событие может прийти несколько раз, в том числе одновременно (outbox публикует
+    at-least-once). Результат эмулятора фиксируется условным UPDATE ровно один раз.
+
+    Расписание доставки webhook хранится в строке платежа: счётчик попыток и время,
+    раньше которого следующая попытка не начнётся. Попытка резервируется коротким
+    коммитом до HTTP-запроса, поэтому её не откатит сбой базы после ответа получателя,
+    а копия события, пришедшая раньше времени, получает NotDue и ждёт в retry-очереди.
     """
 
     def __init__(
@@ -37,12 +61,16 @@ class PaymentProcessor:
         session_factory: async_sessionmaker[AsyncSession],
         gateway: PaymentGateway,
         webhooks: WebhookSender,
+        attempt_lease: float,
     ) -> None:
         self._session_factory = session_factory
         self._gateway = gateway
         self._webhooks = webhooks
+        # Сколько попытка считается идущей. Если процесс упал посреди запроса, следующая
+        # копия события начнёт новую попытку не раньше, чем истечёт этот срок.
+        self._lease = timedelta(seconds=attempt_lease)
 
-    async def process(self, payment_id: uuid.UUID) -> None:
+    async def process(self, payment_id: uuid.UUID) -> Outcome:
         payment = await self._load(payment_id)
         if payment is None:
             raise PaymentNotFound(payment_id)
@@ -52,14 +80,25 @@ class PaymentProcessor:
             result = await self._gateway.charge(payment)
             await self._save_charge_result(payment_id, result)
 
-        await self._notify(payment_id)
+        claimed = await self._claim_attempt(payment_id)
+        if not isinstance(claimed, Payment):
+            return claimed
+
+        attempt = claimed.webhook_attempts
+        try:
+            await self._webhooks.send(claimed.webhook_url, payment_event(claimed))
+        except WebhookDeliveryError as exc:
+            return await self._record_failure(payment_id, attempt, str(exc))
+
+        await self._record_delivery(payment_id)
+        return Delivered()
 
     async def _load(self, payment_id: uuid.UUID) -> Payment | None:
         async with self._session_factory() as session:
             return await session.scalar(select(Payment).where(Payment.id == payment_id))
 
     async def _save_charge_result(self, payment_id: uuid.UUID, result: ChargeResult) -> None:
-        # Если дубль события успел первым, UPDATE ничего не изменит и останется его результат.
+        # Если копия события успела первой, UPDATE ничего не изменит и останется её результат.
         async with self._session_factory() as session, session.begin():
             await session.execute(
                 update(Payment)
@@ -72,34 +111,77 @@ class PaymentProcessor:
                 )
             )
 
-    async def _notify(self, payment_id: uuid.UUID) -> None:
-        failure: WebhookAttemptFailed | None = None
-
-        # Блокировка строки держится на время запроса к получателю (не дольше webhook_deadline):
-        # это право на попытку. Дубль ждёт и после разблокировки видит итог предыдущей.
-        # Если процесс упадёт, соединение с БД закроется и блокировка снимется сама.
+    async def _claim_attempt(self, payment_id: uuid.UUID) -> Payment | Delivered | GaveUp | NotDue:
         async with self._session_factory() as session, session.begin():
-            payment = await session.scalar(select(Payment).where(Payment.id == payment_id).with_for_update())
-            if payment is None:
+            row = (
+                await session.execute(
+                    select(Payment, func.clock_timestamp()).where(Payment.id == payment_id).with_for_update()
+                )
+            ).one_or_none()
+            if row is None:
                 raise PaymentNotFound(payment_id)
-            if payment.webhook_status is not WebhookStatus.PENDING:
-                return
+            payment, now = row
+
+            if payment.webhook_status is WebhookStatus.DELIVERED:
+                return Delivered(already=True)
+            if payment.webhook_status is WebhookStatus.FAILED:
+                return GaveUp(payment.webhook_last_error)
             if payment.status is PaymentStatus.PENDING:
                 raise RuntimeError(f"payment {payment_id} has no result yet")
 
-            payment.webhook_attempts += 1
-            payment.updated_at = datetime.now(UTC)
-            try:
-                await self._webhooks.send(payment.webhook_url, payment_event(payment))
-            except WebhookDeliveryError as exc:
-                payment.webhook_last_error = str(exc)
-                if payment.webhook_attempts >= MAX_ATTEMPTS:
-                    payment.webhook_status = WebhookStatus.FAILED
-                failure = WebhookAttemptFailed(payment.webhook_attempts, str(exc))
-            else:
-                payment.webhook_status = WebhookStatus.DELIVERED
-                payment.webhook_delivered_at = datetime.now(UTC)
-                payment.webhook_last_error = None
+            if payment.webhook_next_attempt_at is not None and payment.webhook_next_attempt_at > now:
+                return NotDue((payment.webhook_next_attempt_at - now).total_seconds())
 
-        if failure is not None:
-            raise failure
+            if payment.webhook_attempts >= MAX_ATTEMPTS:
+                # Последняя попытка началась, но её результат не записан (процесс упал).
+                payment.webhook_status = WebhookStatus.FAILED
+                payment.updated_at = now
+                return GaveUp(payment.webhook_last_error)
+
+            payment.webhook_attempts += 1
+            payment.webhook_next_attempt_at = now + self._lease
+            payment.updated_at = now
+            return payment
+
+    async def _record_failure(self, payment_id: uuid.UUID, attempt: int, error: str) -> Outcome:
+        final = attempt >= MAX_ATTEMPTS
+        delay = 0 if final else RETRY_DELAYS[attempt - 1]
+        values = {
+            "webhook_last_error": error,
+            "webhook_next_attempt_at": func.clock_timestamp() + timedelta(seconds=delay),
+            "updated_at": func.now(),
+        }
+        if final:
+            values["webhook_status"] = WebhookStatus.FAILED
+
+        async with self._session_factory() as session, session.begin():
+            result = await session.execute(
+                update(Payment)
+                .where(
+                    Payment.id == payment_id,
+                    Payment.webhook_status == WebhookStatus.PENDING,
+                    # Пока шёл запрос, срок попытки мог истечь и начаться следующая.
+                    # Тогда этот результат устарел, и записывать его нельзя.
+                    Payment.webhook_attempts == attempt,
+                )
+                .values(**values)
+            )
+        if result.rowcount == 0:  # type: ignore[attr-defined]
+            return NotDue(RETRY_DELAYS[0])
+        if final:
+            return GaveUp(error)
+        return AttemptFailed(attempt, error, retry_in=delay)
+
+    async def _record_delivery(self, payment_id: uuid.UUID) -> None:
+        async with self._session_factory() as session, session.begin():
+            await session.execute(
+                update(Payment)
+                .where(Payment.id == payment_id, Payment.webhook_status == WebhookStatus.PENDING)
+                .values(
+                    webhook_status=WebhookStatus.DELIVERED,
+                    webhook_delivered_at=func.now(),
+                    webhook_last_error=None,
+                    webhook_next_attempt_at=None,
+                    updated_at=func.now(),
+                )
+            )

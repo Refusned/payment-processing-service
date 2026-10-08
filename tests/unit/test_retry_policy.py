@@ -5,19 +5,23 @@ from app.messaging import (
     attempt_of,
     dead_letter_queue,
     new_queue,
-    retry_queue_after,
+    retry_queue_for,
     retry_queues,
 )
 
 
 def test_three_attempts_with_growing_delay():
     assert MAX_ATTEMPTS == 3
-    assert retry_queue_after(1) is retry_queues[0]
-    assert retry_queue_after(2) is retry_queues[1]
-    assert retry_queue_after(3) is None
+    assert retry_queue_for(2) is retry_queues[0]
+    assert retry_queue_for(4) is retry_queues[1]
 
     ttls = [queue.arguments["x-message-ttl"] for queue in retry_queues]
     assert ttls == [2000, 4000]
+
+
+@pytest.mark.parametrize(("delay", "expected"), [(0.3, "2s"), (2, "2s"), (2.5, "4s"), (4, "4s"), (15, "4s")])
+def test_retry_queue_for_delay(delay, expected):
+    assert retry_queue_for(delay).name == f"payments.retry.{expected}"
 
 
 def test_retry_queues_return_messages_to_work_queue():

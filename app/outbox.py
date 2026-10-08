@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 
 MAX_EVENT_BACKOFF = 60
 MAX_LOOP_BACKOFF = 30
+CONNECT_TIMEOUT = 30
 # Цикл обновляет heartbeat на каждой итерации. Если он молчит дольше, релей считается зависшим.
 STALL_AFTER = 60
 
@@ -68,8 +69,10 @@ class OutboxRelay:
             self._heartbeat = time.monotonic()
             try:
                 if not self._connected:
-                    await self._broker.connect()
-                    await declare_topology(self._broker)
+                    # Без срока подключение к узлу, который принял TCP, но молчит, висело бы вечно.
+                    async with asyncio.timeout(CONNECT_TIMEOUT):
+                        await self._broker.connect()
+                        await declare_topology(self._broker)
                     self._connected = True
                 published = await self.publish_batch()
             except Exception:

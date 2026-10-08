@@ -108,11 +108,13 @@ def attempt_of(headers: Mapping[str, Any]) -> int:
         return 1
 
 
-def retry_queue_after(attempt: int) -> RabbitQueue | None:
-    """Очередь, через которую пойдёт следующая попытка, или None, если попытки исчерпаны."""
-    if attempt < MAX_ATTEMPTS:
-        return retry_queues[attempt - 1]
-    return None
+def retry_queue_for(delay: float) -> RabbitQueue:
+    """Самая короткая retry-очередь, чей TTL не меньше delay. Если такой нет, самая длинная:
+    сообщение вернётся раньше срока и подождёт ещё круг."""
+    for queue, queue_delay in zip(retry_queues, RETRY_DELAYS, strict=True):
+        if queue_delay >= delay:
+            return queue
+    return retry_queues[-1]
 
 
 async def reliable_publish(

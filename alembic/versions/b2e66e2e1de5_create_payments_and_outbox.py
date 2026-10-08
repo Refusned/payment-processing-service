@@ -35,6 +35,7 @@ def upgrade() -> None:
         sa.Column("webhook_status", sa.String(16), server_default="pending", nullable=False),
         sa.Column("webhook_attempts", sa.Integer(), server_default="0", nullable=False),
         sa.Column("webhook_last_error", sa.Text(), nullable=True),
+        sa.Column("webhook_next_attempt_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("webhook_delivered_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
         sa.Column("processed_at", sa.DateTime(timezone=True), nullable=True),

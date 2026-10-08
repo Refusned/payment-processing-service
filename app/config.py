@@ -5,11 +5,13 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+    # allow_inf_nan: иначе "Infinity" в переменной окружения снимет любой таймаут.
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore", allow_inf_nan=False)
 
     database_url: str = "postgresql+asyncpg://payments:payments@localhost:5432/payments"
     rabbitmq_url: str = "amqp://guest:guest@localhost:5672/"
-    api_key: str = Field(min_length=1)
+    # Печатный ASCII: значение HTTP-заголовка, другие символы клиент не передаст как есть.
+    api_key: str = Field(min_length=1, pattern=r"^[\x21-\x7e]+$")
     # ТЗ требует ключ на всех эндпоинтах, поэтому Swagger по умолчанию выключен.
     docs_enabled: bool = False
 
