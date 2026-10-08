@@ -1,4 +1,5 @@
 import asyncio
+import json
 import uuid
 
 import httpx
@@ -18,6 +19,12 @@ async def test_api_key_is_required(method, path, api_key):
     async with httpx.AsyncClient(base_url=API_URL) as client:
         response = await client.request(method, path, json=payment_body(), headers=headers)
     assert response.status_code == 401
+
+
+@pytest.mark.parametrize("path", ["/docs", "/openapi.json"])
+async def test_docs_are_disabled_by_default(path):
+    async with httpx.AsyncClient(base_url=API_URL) as client:
+        assert (await client.get(path)).status_code == 404
 
 
 async def test_health(api):
@@ -51,6 +58,27 @@ async def test_invalid_body_is_rejected(api):
         headers={"Idempotency-Key": str(uuid.uuid4())},
     )
     assert response.status_code == 422
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        # После нормализации (punycode, %-кодирование) URL длиннее 2048 символов.
+        {"webhook_url": "http://example.com/" + "я" * 1000},
+        {"metadata": {"value": "\x00"}},
+        {"metadata": {"value": float("inf")}},
+        {"metadata": {"deep": json.loads("[" * 40 + "]" * 40)}},
+        {"description": "\ud800"},
+    ],
+)
+async def test_unstorable_input_is_rejected(api, overrides):
+    # json.dumps, а не json= у httpx: нужно отправить Infinity и одиночный суррогат как есть.
+    response = await api.post(
+        "/api/v1/payments",
+        content=json.dumps(payment_body() | overrides),
+        headers={"Idempotency-Key": str(uuid.uuid4()), "Content-Type": "application/json"},
+    )
+    assert response.status_code == 422, response.text
 
 
 async def test_repeat_with_same_body_returns_original_response(api, db):
@@ -127,7 +155,16 @@ async def test_get_payment(api):
     assert payment["idempotency_key"] == key
     assert payment["webhook_url"] == payment_body()["webhook_url"]
     assert payment["created_at"] == created.json()["created_at"]
-    assert {"status", "processed_at", "failure_reason", "webhook_status", "updated_at"} <= set(payment)
+    assert {
+        "status",
+        "processed_at",
+        "failure_reason",
+        "webhook_status",
+        "webhook_attempts",
+        "webhook_last_error",
+        "webhook_delivered_at",
+        "updated_at",
+    } <= set(payment)
     assert "request_hash" not in payment
 
 

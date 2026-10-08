@@ -1,5 +1,8 @@
 import random
 
+import pytest
+
+from app.config import Settings
 from app.gateway import EmulatedGateway
 from app.models import Payment
 
@@ -37,3 +40,32 @@ async def test_hooks_force_the_outcome():
     assert not (await gw.charge(payment({"emulator": {"result": "failed"}}))).succeeded
     gw = gateway(success_rate=0, test_hooks=True)
     assert (await gw.charge(payment({"emulator": {"result": "succeeded"}}))).succeeded
+
+
+async def test_default_settings_match_the_task(monkeypatch):
+    delays = []
+
+    async def fake_sleep(seconds):
+        delays.append(seconds)
+
+    monkeypatch.setattr("app.gateway.asyncio.sleep", fake_sleep)
+    gw = EmulatedGateway.from_settings(Settings(api_key="x"))
+    results = [await gw.charge(payment()) for _ in range(2000)]
+
+    assert min(delays) >= 2 and max(delays) <= 5
+    assert 0.87 < sum(r.succeeded for r in results) / len(results) < 0.93
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"api_key": ""},
+        {"gateway_min_delay": 6},
+        {"gateway_success_rate": 1.5},
+        {"outbox_batch_size": 0},
+        {"consumer_prefetch": 0},
+    ],
+)
+def test_invalid_settings_are_rejected(overrides):
+    with pytest.raises(ValueError):
+        Settings(**{"api_key": "x", **overrides})

@@ -3,13 +3,14 @@ from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from sqlalchemy import text
 
 from app.api import SessionDep, require_api_key, router
 from app.config import settings
 from app.db import engine, session_factory
-from app.messaging import build_broker, declare_topology
+from app.messaging import build_broker
 from app.outbox import OutboxRelay
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -19,9 +20,6 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     broker = build_broker()
-    await broker.connect()
-    await declare_topology(broker)
-
     relay = OutboxRelay(broker, session_factory)
     relay.start()
     app.state.relay = relay
@@ -35,13 +33,21 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
 
 app = FastAPI(
     title="Payment processing service",
-    version="1.0.0",
+    version="0.1.0",
     lifespan=lifespan,
     docs_url="/docs" if settings.docs_enabled else None,
     redoc_url=None,
     openapi_url="/openapi.json" if settings.docs_enabled else None,
 )
 app.include_router(router)
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_error(request: Request, exc: RequestValidationError) -> JSONResponse:
+    # Без поля input: в нём может оказаться текст, который не сериализуется в ответ
+    # (например, одиночный суррогат), и вместо 422 клиент получил бы 500.
+    errors = [{"loc": e["loc"], "msg": e["msg"], "type": e["type"]} for e in exc.errors()]
+    return JSONResponse({"detail": errors}, status_code=422)
 
 
 @app.get("/health", dependencies=[Depends(require_api_key)], tags=["service"])

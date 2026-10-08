@@ -80,7 +80,7 @@ class Payment(Base):
     failure_reason: Mapped[str | None] = mapped_column(String(255))
 
     idempotency_key: Mapped[str] = mapped_column(String(255), unique=True)
-    # sha256 тела запроса: повтор ключа с другим телом отклоняется, а не возвращает чужой платёж.
+    # sha256 тела запроса: тот же ключ с другим телом отклоняется, а не возвращает ранее созданный платёж.
     request_hash: Mapped[str] = mapped_column(String(64))
 
     webhook_url: Mapped[str] = mapped_column(String(2048))

@@ -4,7 +4,7 @@ import pytest
 from pydantic import ValidationError
 
 from app.payments import request_fingerprint
-from app.schemas import MAX_METADATA_BYTES, PaymentCreate
+from app.schemas import MAX_METADATA_BYTES, MAX_METADATA_DEPTH, PaymentCreate
 
 
 def body(**overrides):
@@ -36,9 +36,18 @@ def test_valid_body():
         {"webhook_url": "ftp://example.com/hook"},
         {"webhook_url": "not a url"},
         {"webhook_url": "https://example.com/" + "a" * 2048},
+        # 1000 символов кириллицы после %-кодирования превращаются в 6000.
+        {"webhook_url": "https://example.com/" + "я" * 1000},
         {"description": "x" * 1025},
         {"metadata": ["not", "an", "object"]},
         {"metadata": {"blob": "x" * MAX_METADATA_BYTES}},
+        {"metadata": {"value": "a\x00b"}},
+        {"metadata": {"a\x00b": 1}},
+        {"metadata": {"value": float("inf")}},
+        {"metadata": {"value": [float("nan")]}},
+        {"metadata": {"value": "\ud800"}},
+        {"description": "a\x00b"},
+        {"description": "\ud800"},
         {"unexpected": "field"},
     ],
 )
@@ -92,3 +101,15 @@ def test_fingerprint_ignores_metadata_key_order():
 def test_fingerprint_detects_changes(overrides):
     original = request_fingerprint(PaymentCreate.model_validate(body()))
     assert request_fingerprint(PaymentCreate.model_validate(body(**overrides))) != original
+
+
+def test_metadata_depth_limit():
+    def nested(depth):
+        value = {}
+        for _ in range(depth):
+            value = {"x": value}
+        return value
+
+    PaymentCreate.model_validate(body(metadata=nested(MAX_METADATA_DEPTH)))
+    with pytest.raises(ValidationError):
+        PaymentCreate.model_validate(body(metadata=nested(MAX_METADATA_DEPTH + 2)))
