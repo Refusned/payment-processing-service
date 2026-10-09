@@ -223,21 +223,6 @@ X-Event-Type: payment.succeeded
 
 Коды для идемпотентности взяты из драфта IETF [Idempotency-Key HTTP Header](https://datatracker.ietf.org/doc/draft-ietf-httpapi-idempotency-key-header/): 400 без ключа, 422 при повторе ключа с другим телом. Повтор возвращает исходный ответ (`status: pending`), актуальный статус отдаёт GET.
 
-## Требования задания
-
-| Требование | Где |
-|---|---|
-| Модели и миграции: `payments` и `outbox` | `app/models.py`, `alembic/versions/` |
-| `POST /api/v1/payments` с обязательным `Idempotency-Key`, ответ 202 | `app/api.py`, `app/payments.py` |
-| `GET /api/v1/payments/{payment_id}` | `app/api.py` |
-| Событие в `payments.new` через outbox | `app/payments.py` (запись), `app/outbox.py` (публикация) |
-| Один consumer: эмуляция 2-5 c и 90/10, статус, webhook, повторы | `app/consumer.py`, `app/processing.py`, `app/gateway.py`, `app/webhooks.py` |
-| 3 попытки с экспоненциальной задержкой | `app/messaging.py` (очереди 2 c и 4 c), `app/processing.py` (расписание) |
-| Dead Letter Queue | `app/messaging.py` (`payments.dlx` и `payments.dlq`) |
-| `X-API-Key` на всех эндпоинтах | `app/api.py` |
-| Docker Compose: postgres, rabbitmq, api, consumer | `docker-compose.yml`, `Dockerfile` |
-| README с запуском и примерами | этот файл, `scripts/demo.sh` |
-
 ## Структура
 
 ```
@@ -302,7 +287,7 @@ make test-integration    # отдельный стек payments-test со сво
 
 В RabbitMQ UI: Queues, `payments.dlq`, Get messages. Заголовок `x-event-id` совпадает с `outbox.id`, по нему находится платёж. Причина последней неудачной доставки лежит в `webhook_last_error` (видна и через GET), остальные ошибки в логах consumer. Автоматически из DLQ ничего не переигрывается: это отдельное решение после того, как причина устранена (например, перенос сообщений обратно в `payments.new` через shovel со сбросом `webhook_status` в `pending`, `webhook_attempts` в 0 и `webhook_next_attempt_at` в NULL, без заголовка `x-infra-retries`).
 
-## Что добавил бы для продакшена
+## Дальнейшие улучшения
 
 - Подпись webhook (HMAC) и проверку `webhook_url` на внутренние адреса.
 - Разделение ошибок получателя на временные и постоянные (4xx кроме 408 и 429 сразу в DLQ).

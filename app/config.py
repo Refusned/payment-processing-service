@@ -11,7 +11,7 @@ class Settings(BaseSettings):
     database_url: str = "postgresql+asyncpg://payments:payments@localhost:55432/payments"
     rabbitmq_url: str = "amqp://guest:guest@localhost:55672/"
     api_key: str = Field(min_length=1, pattern=r"^[\x21-\x7e]+$")
-    # ТЗ требует ключ на всех эндпоинтах, поэтому Swagger по умолчанию выключен.
+    # Ключ нужен на всех эндпоинтах, поэтому Swagger по умолчанию выключен.
     docs_enabled: bool = False
 
     db_pool_size: int = Field(default=10, ge=1)
